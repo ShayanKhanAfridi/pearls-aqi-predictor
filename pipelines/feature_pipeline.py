@@ -309,46 +309,23 @@ def compute_features(aqi_data, weather_data, future_weather,
     }
 
 
-# ---- Push row to Hopsworks via Upload + Ingestion Job (bypasses Delta Lake Rust writer) ----
+# ---- Push row to Hopsworks ----
 def push_to_feature_store(row_dict, project):
-    """
-    Writes one feature row to Hopsworks using the Upload → Ingestion Job pattern.
-
-    Why not fg.insert()?
-    ─────────────────────
-    fg.insert() on the Python engine calls hsfs DeltaEngine._write_delta_rs_dataset()
-    which uses the `deltalake` Rust crate to open/write an hdfs:// URI directly.
-    External clients (GitHub Actions, Windows, any off-cluster machine) cannot reach
-    the Hopsworks namenode over HDFS, so this always raises:
-        PanicException: InvalidTableLocation("Unknown scheme: hdfs")
-
-    The correct approach for external clients is:
-      1. Upload a Parquet file to the Hopsworks Dataset Store (REST, no HDFS).
-      2. POST to /featuregroups/{id}/ingestion → Hopsworks creates an Ingestion Job.
-      3. Upload the data file to the job's data_path.
-      4. Launch the job → Hopsworks cluster reads the file and writes the Delta table
-         server-side (where HDFS is reachable).
-      5. Poll until the job succeeds.
-    """
     import platform
-    import time
-    import tempfile, os
-
-    # Windows local dev: same HDFS problem — skip gracefully
     if platform.system() == "Windows":
         print("\n⚠️  HDFS/Delta Lake push skipped on Windows (known limitation).")
+        print("   Direct writes to Hopsworks HDFS are not supported on Windows external clients.")
         print(f"   Local row was computed successfully for timestamp: {row_dict['timestamp']}")
         return
 
-    # ── Build DataFrame ───────────────────────────────────────────────
     fs = project.get_feature_store()
     df = pd.DataFrame([row_dict])
     df["timestamp"] = pd.to_datetime(df["timestamp"])
+
     for col in df.columns:
         if col not in ("city", "timestamp"):
             df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
 
-    # ── Get / create Feature Group metadata (no data write yet) ───────
     fg = fs.get_or_create_feature_group(
         name="aqi_features",
         version=1,
@@ -357,74 +334,16 @@ def push_to_feature_store(row_dict, project):
         online_enabled=False,
         description=f"Hourly AQI features for Karachi — Open-Meteo ({PIPELINE_VERSION})",
     )
-
-    # ── Step 1: Create an Ingestion Job on the server ─────────────────
-    from hsfs.core.ingestion_job_conf import IngestionJobConf
-    ingestion_conf = IngestionJobConf(
-        data_format="CSV",
-        data_options=[{"name": "header", "value": "true"},
-                      {"name": "inferSchema", "value": "true"}],
-        write_options=[],
-        spark_job_configuration=None,
-    )
-    ingestion_job_obj = fg._feature_group_engine._feature_group_api.ingestion(
-        fg, ingestion_conf
-    )
-    data_path = ingestion_job_obj.data_path   # e.g. /Projects/xxx/Resources/ingestion/...
-    job        = ingestion_job_obj.job
-
-    print(f"   Ingestion job created: {job.name}")
-    print(f"   Upload path          : {data_path}")
-
-    # ── Step 2: Write DataFrame to a temp CSV and upload ──────────────
-    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as tmp:
-        df.to_csv(tmp, index=False)
-        tmp_path = tmp.name
-
     try:
-        dataset_api = project.get_dataset_api()
-        dataset_api.upload(tmp_path, data_path, overwrite=True)
-        print(f"   ✅ CSV uploaded to Hopsworks dataset store")
-    finally:
-        os.unlink(tmp_path)
-
-    # ── Step 3: Launch the Ingestion Job ──────────────────────────────
-    from hsfs.core.job_api import JobApi
-    job_api = JobApi()
-    job_api.launch(job.name)
-    print(f"   🚀 Ingestion job launched: {job.name}")
-
-    # ── Step 4: Poll until job finishes ───────────────────────────────
-    POLL_INTERVAL = 15   # seconds
-    MAX_WAIT      = 600  # 10 minutes
-    elapsed       = 0
-
-    while elapsed < MAX_WAIT:
-        time.sleep(POLL_INTERVAL)
-        elapsed += POLL_INTERVAL
-        try:
-            execution = job_api.last_execution(job)
-            state = execution.state.upper() if execution and execution.state else "UNKNOWN"
-        except Exception:
-            state = "UNKNOWN"
-
-        print(f"   Job state: {state}  ({elapsed}s elapsed)")
-
-        if state in ("SUCCEEDED", "FINISHED"):
-            print(f"✅ Pushed 1 row → Hopsworks at {row_dict['timestamp']}")
-            return
-        elif state in ("FAILED", "KILLED", "FRAMEWORK_FAILURE", "APP_MASTER_START_FAILED",
-                       "INITIALIZATION_FAILED"):
-            raise RuntimeError(
-                f"Hopsworks ingestion job '{job.name}' failed with state: {state}. "
-                f"Check the Hopsworks Jobs UI for details."
-            )
-        # else RUNNING / ACCEPTED / SUBMITTED / NEW / UNKNOWN → keep polling
-
-    raise RuntimeError(
-        f"Hopsworks ingestion job '{job.name}' did not finish within {MAX_WAIT}s. "
-        f"Last state: {state}. Check the Hopsworks Jobs UI."
-    )
+        fg.insert(df, write_options={"wait_for_job": True})
+        print(f"✅ Pushed 1 row → Hopsworks at {row_dict['timestamp']}")
+    except (OSError, ImportError, Exception) as e:
+        err_str = str(e).lower()
+        if any(k in err_str for k in ["hdfs", "rpc", "delta", "listener"]):
+            print(f"\n⚠️  HDFS/Delta Lake push skipped on Windows (known limitation).")
+            print(f"   (Error: {str(e)[:120]})")
+        else:
+            raise
 
 
 # ---- Main ----

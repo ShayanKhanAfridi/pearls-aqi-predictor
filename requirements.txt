@@ -14,7 +14,7 @@ python-dotenv>=1.0.0
 
 # ── Feature Store & Model Registry ───────────────────────────
 hopsworks==4.7.5
-deltalake==0.17.4        # pinned: 0.18+ Rust HDFS writer breaks on GitHub Actions
+deltalake>=0.17.0
 
 # ── Data & ML ────────────────────────────────────────────────
 pandas>=2.0.0
