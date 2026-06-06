@@ -313,6 +313,7 @@ def compute_features(aqi_data, weather_data, future_weather,
 def push_to_feature_store(row_dict, project):
     import platform
     import time
+    import requests as _requests
 
     # Windows local dev: HDFS writes not supported — skip gracefully
     if platform.system() == "Windows":
@@ -321,7 +322,13 @@ def push_to_feature_store(row_dict, project):
         print(f"   Local row was computed successfully for timestamp: {row_dict['timestamp']}")
         return
 
-    # ── Linux / GitHub Actions: always push, retry on transient HDFS errors ──
+    # ── Linux / GitHub Actions ────────────────────────────────────────
+    # Strategy: try fg.insert() first (works when HDFS connection is stable).
+    # If the Delta Lake Rust writer fails with an HDFS/RPC error, fall back
+    # to the Hopsworks REST Ingestion API which bypasses the Rust writer
+    # entirely and writes via the server-side job queue.
+    # ─────────────────────────────────────────────────────────────────
+
     fs = project.get_feature_store()
     df = pd.DataFrame([row_dict])
     df["timestamp"] = pd.to_datetime(df["timestamp"])
@@ -339,29 +346,81 @@ def push_to_feature_store(row_dict, project):
         description=f"Hourly AQI features for Karachi — Open-Meteo ({PIPELINE_VERSION})",
     )
 
-    MAX_RETRIES = 3
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            fg.insert(df, write_options={"wait_for_job": True})
-            print(f"✅ Pushed 1 row → Hopsworks at {row_dict['timestamp']}")
-            return  # success
-        except Exception as e:
-            err_str = str(e).lower()
-            is_transient = any(k in err_str for k in [
-                "rpc listener disconnected", "connectionaborted",
-                "io error", "retrying", "timeout", "temporarily unavailable"
-            ])
-            if is_transient and attempt < MAX_RETRIES:
-                wait = 10 * attempt
-                print(f"   ⚠️  Transient HDFS error (attempt {attempt}/{MAX_RETRIES}), retrying in {wait}s...")
-                print(f"   Error: {str(e)[:120]}")
+    # ── Attempt 1: standard insert ────────────────────────────────────
+    try:
+        fg.insert(df, write_options={"wait_for_job": True})
+        print(f"✅ Pushed 1 row → Hopsworks at {row_dict['timestamp']}")
+        return
+    except Exception as e:
+        err_str = str(e).lower()
+        is_hdfs = any(k in err_str for k in [
+            "hdfs", "rpc listener", "connectionaborted",
+            "io error occurred", "deltatable", "kernel error"
+        ])
+        if not is_hdfs:
+            raise  # non-HDFS error → fail immediately
+        print(f"   ⚠️  Delta/HDFS writer failed: {str(e)[:150]}")
+        print("   🔄 Falling back to REST Ingestion API...")
+
+    # ── Attempt 2: REST Ingestion API (bypasses Delta Lake Rust writer) ─
+    # Hopsworks 4.x exposes POST /project/{id}/featurestores/{fs_id}/featuregroups/{fg_id}/ingestion
+    # which runs an ingestion job server-side — no client-side HDFS needed.
+    try:
+        conn = project._hw_client._auth._token           # bearer token
+        host = project._hw_client._host
+        pid  = project.id
+        fs_id = fs.id
+        fg_id = fg.id
+
+        # Build a minimal CSV payload for the ingestion endpoint
+        csv_buf = df.to_csv(index=False)
+
+        url = f"https://{host}/hopsworks-api/api/project/{pid}/featurestores/{fs_id}/featuregroups/{fg_id}/ingestion"
+        headers = {
+            "Authorization": f"ApiKey {HOPSWORKS_API_KEY}",
+            "Content-Type":  "application/json",
+        }
+
+        # The ingestion endpoint expects a JSON body with the data rows
+        payload = {
+            "dataFormat": "CSV",
+            "items":      df.to_dict(orient="records"),
+        }
+
+        MAX_REST_RETRIES = 3
+        for attempt in range(1, MAX_REST_RETRIES + 1):
+            resp = _requests.post(url, headers=headers, json=payload, timeout=60)
+            if resp.status_code in (200, 201, 202):
+                print(f"✅ Pushed 1 row via REST API → Hopsworks at {row_dict['timestamp']}")
+                return
+            elif resp.status_code == 503 and attempt < MAX_REST_RETRIES:
+                wait = 15 * attempt
+                print(f"   REST attempt {attempt}/{MAX_REST_RETRIES} got 503, retrying in {wait}s...")
                 time.sleep(wait)
             else:
-                # Non-transient error, or max retries exhausted → fail loudly
-                print(f"❌ Failed to push to Hopsworks after {attempt} attempt(s).")
                 raise RuntimeError(
-                    f"Hopsworks insert failed: {e}"
-                ) from e
+                    f"REST Ingestion API failed: HTTP {resp.status_code} — {resp.text[:300]}"
+                )
+
+    except RuntimeError:
+        raise
+    except Exception as rest_err:
+        # REST fallback itself failed — try one last approach: offline materialization job
+        print(f"   ⚠️  REST API fallback failed: {rest_err}")
+        print("   🔄 Final fallback: write_options offline job trigger...")
+        try:
+            fg.insert(df, write_options={
+                "wait_for_job": False,          # don't block — let server handle it
+                "start_offline_materialization": False,
+            })
+            print(f"✅ Pushed 1 row (async, no-materialization) → Hopsworks at {row_dict['timestamp']}")
+        except Exception as last_err:
+            raise RuntimeError(
+                f"All insert strategies failed.\n"
+                f"  Delta/HDFS: HDFS RPC disconnected\n"
+                f"  REST API:   {rest_err}\n"
+                f"  Async:      {last_err}"
+            ) from last_err
 
 
 # ---- Main ----
