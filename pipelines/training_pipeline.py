@@ -14,21 +14,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── DNS fix for Windows: ensure hopsworks domains resolve correctly ──
-import socket as _socket
+if sys.platform == "win32":
+    import socket as _socket
+    _HOPSWORKS_IP = "57.130.17.86"  # eu-west.cloud.hopsworks.ai
+    _DNS_OVERRIDES = {
+        "eu-west.cloud.hopsworks.ai": _HOPSWORKS_IP,
+    }
+    _orig_getaddrinfo = _socket.getaddrinfo
 
-_HOPSWORKS_IP = "57.130.17.86"  # eu-west.cloud.hopsworks.ai
-_DNS_OVERRIDES = {
-    "eu-west.cloud.hopsworks.ai": _HOPSWORKS_IP,
-}
-_orig_getaddrinfo = _socket.getaddrinfo
+    def _patched_getaddrinfo(host, port, *args, **kwargs):
+        if host in _DNS_OVERRIDES:
+            port_num = port if port else 443
+            return [(2, 1, 6, '', (_DNS_OVERRIDES[host], port_num))]
+        return _orig_getaddrinfo(host, port, *args, **kwargs)
 
-def _patched_getaddrinfo(host, port, *args, **kwargs):
-    if host in _DNS_OVERRIDES:
-        port_num = port if port else 443
-        return [(2, 1, 6, '', (_DNS_OVERRIDES[host], port_num))]
-    return _orig_getaddrinfo(host, port, *args, **kwargs)
-
-_socket.getaddrinfo = _patched_getaddrinfo
+    _socket.getaddrinfo = _patched_getaddrinfo
 # ── End DNS fix ──
 
 import pandas as pd
