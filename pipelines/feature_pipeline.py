@@ -335,7 +335,7 @@ def push_to_feature_store(row_dict, project):
         description=f"Hourly AQI features for Karachi — Open-Meteo ({PIPELINE_VERSION})",
     )
     try:
-        fg.insert(df, write_options={"wait_for_job": False})
+        fg.insert(df, write_options={"wait_for_job": True})
         print(f"✅ Pushed 1 row → Hopsworks at {row_dict['timestamp']}")
     except (OSError, ImportError, Exception) as e:
         err_str = str(e).lower()
