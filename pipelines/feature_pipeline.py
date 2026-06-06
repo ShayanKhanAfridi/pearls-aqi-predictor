@@ -338,8 +338,8 @@ def push_to_feature_store(row_dict, project):
         fg.insert(df, write_options={"wait_for_job": True})
         print(f"✅ Pushed 1 row → Hopsworks at {row_dict['timestamp']}")
     except (OSError, ImportError, Exception) as e:
-        err_str = str(e).lower()
-        if any(k in err_str for k in ["hdfs", "rpc", "delta", "listener"]):
+        import sys
+        if sys.platform == "win32":
             print(f"\n⚠️  HDFS/Delta Lake push skipped on Windows (known limitation).")
             print(f"   (Error: {str(e)[:120]})")
         else:
