@@ -1,0 +1,59 @@
+# ============================================================
+# .github/workflows/daily_training.yml
+#
+# Runs EVERY DAY at 02:00 UTC:
+#   1. Training Pipeline (pipelines/training_pipeline.py)
+#
+# Retrains all 5 candidate models, selects the best by lowest
+# test_weighted_rmse, and registers the new version in
+# Hopsworks Model Registry.
+# ============================================================
+
+name: 🏋️ Daily Training Pipeline
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # Every day at 02:00 UTC
+  workflow_dispatch:       # Manual trigger
+
+jobs:
+  training_pipeline:
+    name: 🚀 Training Pipeline [v7]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Training Pipeline
+        env:
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+        run: python pipelines/training_pipeline.py
+
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifact-${{ github.run_id }}
+          path: model/aqi_multioutput_model.pkl
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Notify success
+        if: success()
+        run: echo "✅ Training complete. Model registered in Hopsworks at $(date -u)"
+
+      - name: Notify failure
+        if: failure()
+        run: echo "❌ Training failed. Check logs above."
