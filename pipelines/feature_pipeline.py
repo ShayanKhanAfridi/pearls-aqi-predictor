@@ -309,34 +309,46 @@ def compute_features(aqi_data, weather_data, future_weather,
     }
 
 
-# ---- Push row to Hopsworks ----
+# ---- Push row to Hopsworks via Upload + Ingestion Job (bypasses Delta Lake Rust writer) ----
 def push_to_feature_store(row_dict, project):
+    """
+    Writes one feature row to Hopsworks using the Upload → Ingestion Job pattern.
+
+    Why not fg.insert()?
+    ─────────────────────
+    fg.insert() on the Python engine calls hsfs DeltaEngine._write_delta_rs_dataset()
+    which uses the `deltalake` Rust crate to open/write an hdfs:// URI directly.
+    External clients (GitHub Actions, Windows, any off-cluster machine) cannot reach
+    the Hopsworks namenode over HDFS, so this always raises:
+        PanicException: InvalidTableLocation("Unknown scheme: hdfs")
+
+    The correct approach for external clients is:
+      1. Upload a Parquet file to the Hopsworks Dataset Store (REST, no HDFS).
+      2. POST to /featuregroups/{id}/ingestion → Hopsworks creates an Ingestion Job.
+      3. Upload the data file to the job's data_path.
+      4. Launch the job → Hopsworks cluster reads the file and writes the Delta table
+         server-side (where HDFS is reachable).
+      5. Poll until the job succeeds.
+    """
     import platform
     import time
-    import requests as _requests
+    import tempfile, os
 
-    # Windows local dev: HDFS writes not supported — skip gracefully
+    # Windows local dev: same HDFS problem — skip gracefully
     if platform.system() == "Windows":
         print("\n⚠️  HDFS/Delta Lake push skipped on Windows (known limitation).")
-        print("   Direct writes to Hopsworks HDFS are not supported on Windows external clients.")
         print(f"   Local row was computed successfully for timestamp: {row_dict['timestamp']}")
         return
 
-    # ── Linux / GitHub Actions ────────────────────────────────────────
-    # Strategy: try fg.insert() first (works when HDFS connection is stable).
-    # If the Delta Lake Rust writer fails with an HDFS/RPC error, fall back
-    # to the Hopsworks REST Ingestion API which bypasses the Rust writer
-    # entirely and writes via the server-side job queue.
-    # ─────────────────────────────────────────────────────────────────
-
+    # ── Build DataFrame ───────────────────────────────────────────────
     fs = project.get_feature_store()
     df = pd.DataFrame([row_dict])
     df["timestamp"] = pd.to_datetime(df["timestamp"])
-
     for col in df.columns:
         if col not in ("city", "timestamp"):
             df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
 
+    # ── Get / create Feature Group metadata (no data write yet) ───────
     fg = fs.get_or_create_feature_group(
         name="aqi_features",
         version=1,
@@ -346,81 +358,73 @@ def push_to_feature_store(row_dict, project):
         description=f"Hourly AQI features for Karachi — Open-Meteo ({PIPELINE_VERSION})",
     )
 
-    # ── Attempt 1: standard insert ────────────────────────────────────
+    # ── Step 1: Create an Ingestion Job on the server ─────────────────
+    from hsfs.core.ingestion_job_conf import IngestionJobConf
+    ingestion_conf = IngestionJobConf(
+        data_format="CSV",
+        data_options=[{"name": "header", "value": "true"},
+                      {"name": "inferSchema", "value": "true"}],
+        write_options=[],
+        spark_job_configuration=None,
+    )
+    ingestion_job_obj = fg._feature_group_engine._feature_group_api.ingestion(
+        fg, ingestion_conf
+    )
+    data_path = ingestion_job_obj.data_path   # e.g. /Projects/xxx/Resources/ingestion/...
+    job        = ingestion_job_obj.job
+
+    print(f"   Ingestion job created: {job.name}")
+    print(f"   Upload path          : {data_path}")
+
+    # ── Step 2: Write DataFrame to a temp CSV and upload ──────────────
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as tmp:
+        df.to_csv(tmp, index=False)
+        tmp_path = tmp.name
+
     try:
-        fg.insert(df, write_options={"wait_for_job": True})
-        print(f"✅ Pushed 1 row → Hopsworks at {row_dict['timestamp']}")
-        return
-    except Exception as e:
-        err_str = str(e).lower()
-        is_hdfs = any(k in err_str for k in [
-            "hdfs", "rpc listener", "connectionaborted",
-            "io error occurred", "deltatable", "kernel error"
-        ])
-        if not is_hdfs:
-            raise  # non-HDFS error → fail immediately
-        print(f"   ⚠️  Delta/HDFS writer failed: {str(e)[:150]}")
-        print("   🔄 Falling back to REST Ingestion API...")
+        dataset_api = project.get_dataset_api()
+        dataset_api.upload(tmp_path, data_path, overwrite=True)
+        print(f"   ✅ CSV uploaded to Hopsworks dataset store")
+    finally:
+        os.unlink(tmp_path)
 
-    # ── Attempt 2: REST Ingestion API (bypasses Delta Lake Rust writer) ─
-    # Hopsworks 4.x exposes POST /project/{id}/featurestores/{fs_id}/featuregroups/{fg_id}/ingestion
-    # which runs an ingestion job server-side — no client-side HDFS needed.
-    try:
-        conn = project._hw_client._auth._token           # bearer token
-        host = project._hw_client._host
-        pid  = project.id
-        fs_id = fs.id
-        fg_id = fg.id
+    # ── Step 3: Launch the Ingestion Job ──────────────────────────────
+    from hsfs.core.job_api import JobApi
+    job_api = JobApi()
+    job_api.launch(job.name)
+    print(f"   🚀 Ingestion job launched: {job.name}")
 
-        # Build a minimal CSV payload for the ingestion endpoint
-        csv_buf = df.to_csv(index=False)
+    # ── Step 4: Poll until job finishes ───────────────────────────────
+    POLL_INTERVAL = 15   # seconds
+    MAX_WAIT      = 600  # 10 minutes
+    elapsed       = 0
 
-        url = f"https://{host}/hopsworks-api/api/project/{pid}/featurestores/{fs_id}/featuregroups/{fg_id}/ingestion"
-        headers = {
-            "Authorization": f"ApiKey {HOPSWORKS_API_KEY}",
-            "Content-Type":  "application/json",
-        }
-
-        # The ingestion endpoint expects a JSON body with the data rows
-        payload = {
-            "dataFormat": "CSV",
-            "items":      df.to_dict(orient="records"),
-        }
-
-        MAX_REST_RETRIES = 3
-        for attempt in range(1, MAX_REST_RETRIES + 1):
-            resp = _requests.post(url, headers=headers, json=payload, timeout=60)
-            if resp.status_code in (200, 201, 202):
-                print(f"✅ Pushed 1 row via REST API → Hopsworks at {row_dict['timestamp']}")
-                return
-            elif resp.status_code == 503 and attempt < MAX_REST_RETRIES:
-                wait = 15 * attempt
-                print(f"   REST attempt {attempt}/{MAX_REST_RETRIES} got 503, retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                raise RuntimeError(
-                    f"REST Ingestion API failed: HTTP {resp.status_code} — {resp.text[:300]}"
-                )
-
-    except RuntimeError:
-        raise
-    except Exception as rest_err:
-        # REST fallback itself failed — try one last approach: offline materialization job
-        print(f"   ⚠️  REST API fallback failed: {rest_err}")
-        print("   🔄 Final fallback: write_options offline job trigger...")
+    while elapsed < MAX_WAIT:
+        time.sleep(POLL_INTERVAL)
+        elapsed += POLL_INTERVAL
         try:
-            fg.insert(df, write_options={
-                "wait_for_job": False,          # don't block — let server handle it
-                "start_offline_materialization": False,
-            })
-            print(f"✅ Pushed 1 row (async, no-materialization) → Hopsworks at {row_dict['timestamp']}")
-        except Exception as last_err:
+            execution = job_api.last_execution(job)
+            state = execution.state.upper() if execution and execution.state else "UNKNOWN"
+        except Exception:
+            state = "UNKNOWN"
+
+        print(f"   Job state: {state}  ({elapsed}s elapsed)")
+
+        if state in ("SUCCEEDED", "FINISHED"):
+            print(f"✅ Pushed 1 row → Hopsworks at {row_dict['timestamp']}")
+            return
+        elif state in ("FAILED", "KILLED", "FRAMEWORK_FAILURE", "APP_MASTER_START_FAILED",
+                       "INITIALIZATION_FAILED"):
             raise RuntimeError(
-                f"All insert strategies failed.\n"
-                f"  Delta/HDFS: HDFS RPC disconnected\n"
-                f"  REST API:   {rest_err}\n"
-                f"  Async:      {last_err}"
-            ) from last_err
+                f"Hopsworks ingestion job '{job.name}' failed with state: {state}. "
+                f"Check the Hopsworks Jobs UI for details."
+            )
+        # else RUNNING / ACCEPTED / SUBMITTED / NEW / UNKNOWN → keep polling
+
+    raise RuntimeError(
+        f"Hopsworks ingestion job '{job.name}' did not finish within {MAX_WAIT}s. "
+        f"Last state: {state}. Check the Hopsworks Jobs UI."
+    )
 
 
 # ---- Main ----
