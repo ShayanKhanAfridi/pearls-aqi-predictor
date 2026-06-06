@@ -60,6 +60,26 @@ _retry_session = retry(_cache_session, retries=3, backoff_factor=0.3)
 OM_CLIENT      = openmeteo_requests.Client(session=_retry_session)
 
 
+def call_openmeteo_with_retry(url, params):
+    import time
+    max_retries = 5
+    delay = 15
+    for attempt in range(max_retries):
+        try:
+            return OM_CLIENT.weather_api(url, params=params)[0]
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "limit exceeded" in err_msg or "429" in err_msg:
+                print(f"   ⚠️ Open-Meteo Rate Limit hit (Attempt {attempt+1}/{max_retries}). Sleeping {delay}s...")
+                time.sleep(delay)
+                delay += 15  # increase backoff delay
+            else:
+                print(f"   ⚠️ Open-Meteo connection error: {e}. Retrying in 5s...")
+                time.sleep(5)
+    # Final direct try
+    return OM_CLIENT.weather_api(url, params=params)[0]
+
+
 # ---- Fetch live AQI ----
 def fetch_live_aqi(lat, lon):
     params = {
@@ -69,9 +89,9 @@ def fetch_live_aqi(lat, lon):
                       "sulphur_dioxide", "ozone", "us_aqi"],
         "timezone":  "Asia/Karachi",
     }
-    response = OM_CLIENT.weather_api(
+    response = call_openmeteo_with_retry(
         "https://air-quality-api.open-meteo.com/v1/air-quality", params=params
-    )[0]
+    )
 
     cur = response.Current()
     aqi_data = {
@@ -98,9 +118,9 @@ def fetch_live_weather_and_forecast(lat, lon):
         "forecast_days": 4,
         "timezone":      "Asia/Karachi",
     }
-    response = OM_CLIENT.weather_api(
+    response = call_openmeteo_with_retry(
         "https://api.open-meteo.com/v1/forecast", params=params
-    )[0]
+    )
 
     cur = response.Current()
     weather_data = {
