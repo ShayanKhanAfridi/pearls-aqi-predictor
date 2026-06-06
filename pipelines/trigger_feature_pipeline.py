@@ -26,7 +26,10 @@ def main():
     job_name = "feature_pipeline_job"
     print(f"🚀 Retrieving job '{job_name}'...")
     try:
-        job = project.get_job(job_name)
+        job_api = project.get_job_api()
+        job = job_api.get_job(job_name)
+        if job is None:
+            raise ValueError(f"Job '{job_name}' not found in the project.")
     except Exception as e:
         print(f"❌ Failed to retrieve job '{job_name}': {e}")
         print("\n💡 HOW TO FIX THIS ERROR:")
