@@ -41,7 +41,7 @@ jobs:
       - name: Run Feature Pipeline
         env:
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-        run: python pipelines/feature_pipeline.py
+        run: python pipelines/trigger_feature_pipeline.py
 
       - name: Upload feature log
         if: always()
