@@ -312,12 +312,16 @@ def compute_features(aqi_data, weather_data, future_weather,
 # ---- Push row to Hopsworks ----
 def push_to_feature_store(row_dict, project):
     import platform
+    import time
+
+    # Windows local dev: HDFS writes not supported — skip gracefully
     if platform.system() == "Windows":
         print("\n⚠️  HDFS/Delta Lake push skipped on Windows (known limitation).")
         print("   Direct writes to Hopsworks HDFS are not supported on Windows external clients.")
         print(f"   Local row was computed successfully for timestamp: {row_dict['timestamp']}")
         return
 
+    # ── Linux / GitHub Actions: always push, retry on transient HDFS errors ──
     fs = project.get_feature_store()
     df = pd.DataFrame([row_dict])
     df["timestamp"] = pd.to_datetime(df["timestamp"])
@@ -334,16 +338,30 @@ def push_to_feature_store(row_dict, project):
         online_enabled=False,
         description=f"Hourly AQI features for Karachi — Open-Meteo ({PIPELINE_VERSION})",
     )
-    try:
-        fg.insert(df, write_options={"wait_for_job": True})
-        print(f"✅ Pushed 1 row → Hopsworks at {row_dict['timestamp']}")
-    except (OSError, ImportError, Exception) as e:
-        err_str = str(e).lower()
-        if any(k in err_str for k in ["hdfs", "rpc", "delta", "listener"]):
-            print(f"\n⚠️  HDFS/Delta Lake push skipped on Windows (known limitation).")
-            print(f"   (Error: {str(e)[:120]})")
-        else:
-            raise
+
+    MAX_RETRIES = 3
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            fg.insert(df, write_options={"wait_for_job": True})
+            print(f"✅ Pushed 1 row → Hopsworks at {row_dict['timestamp']}")
+            return  # success
+        except Exception as e:
+            err_str = str(e).lower()
+            is_transient = any(k in err_str for k in [
+                "rpc listener disconnected", "connectionaborted",
+                "io error", "retrying", "timeout", "temporarily unavailable"
+            ])
+            if is_transient and attempt < MAX_RETRIES:
+                wait = 10 * attempt
+                print(f"   ⚠️  Transient HDFS error (attempt {attempt}/{MAX_RETRIES}), retrying in {wait}s...")
+                print(f"   Error: {str(e)[:120]}")
+                time.sleep(wait)
+            else:
+                # Non-transient error, or max retries exhausted → fail loudly
+                print(f"❌ Failed to push to Hopsworks after {attempt} attempt(s).")
+                raise RuntimeError(
+                    f"Hopsworks insert failed: {e}"
+                ) from e
 
 
 # ---- Main ----
