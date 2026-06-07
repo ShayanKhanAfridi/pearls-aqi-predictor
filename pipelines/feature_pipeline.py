@@ -301,7 +301,7 @@ def compute_features(aqi_data, weather_data, future_weather,
         "humidity_x_pm25":         float(weather_data["humidity"] * pm25),
         "temp_x_aqi":              float(weather_data["temperature"] * aqi),
         "pollution_index":         float(pm25 * 0.5 + aqi_data["pm10"] * 0.3 + aqi_data["no2"] * 0.2),
-        # ── v6: residual / regime features ──────────────────────────────
+        # ── Residual / regime features ──────────────────────────────
         "aqi_residual_168h":       float(L("aqi_lag1", aqi) - L("aqi_rolling_mean_168h", aqi)),
         "aqi_residual_72h":        float(L("aqi_lag1", aqi) - L("aqi_rolling_mean_72h",  aqi)),
         "aqi_regime_range":        float(L("aqi_rolling_max_24h", aqi) - L("aqi_rolling_min_24h", aqi)),
@@ -311,13 +311,6 @@ def compute_features(aqi_data, weather_data, future_weather,
 
 # ---- Push row to Hopsworks ----
 def push_to_feature_store(row_dict, project):
-    import platform
-    if platform.system() == "Windows":
-        print("\n⚠️  HDFS/Delta Lake push skipped on Windows (known limitation).")
-        print("   Direct writes to Hopsworks HDFS are not supported on Windows external clients.")
-        print(f"   Local row was computed successfully for timestamp: {row_dict['timestamp']}")
-        return
-
     fs = project.get_feature_store()
     df = pd.DataFrame([row_dict])
     df["timestamp"] = pd.to_datetime(df["timestamp"])
@@ -331,19 +324,12 @@ def push_to_feature_store(row_dict, project):
         version=1,
         primary_key=["city", "timestamp"],
         event_time="timestamp",
-        online_enabled=False,
+        online_enabled=True,
+        stream=True,
         description=f"Hourly AQI features for Karachi — Open-Meteo ({PIPELINE_VERSION})",
     )
-    try:
-        fg.insert(df, write_options={"wait_for_job": True})
-        print(f"✅ Pushed 1 row → Hopsworks at {row_dict['timestamp']}")
-    except (OSError, ImportError, Exception) as e:
-        err_str = str(e).lower()
-        if any(k in err_str for k in ["hdfs", "rpc", "delta", "listener"]):
-            print(f"\n⚠️  HDFS/Delta Lake push skipped on Windows (known limitation).")
-            print(f"   (Error: {str(e)[:120]})")
-        else:
-            raise
+    fg.insert(df, write_options={"wait_for_job": True})
+    print(f"✅ Pushed 1 row → Hopsworks at {row_dict['timestamp']}")
 
 
 # ---- Main ----

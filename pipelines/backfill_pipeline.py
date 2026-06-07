@@ -304,7 +304,8 @@ def push_to_hopsworks(df: pd.DataFrame, project):
         version=1,
         primary_key=["city", "timestamp"],
         event_time="timestamp",
-        online_enabled=False,   # <-- disables Kafka/online store; no twofish needed
+        online_enabled=True,
+        stream=True,
         description=(
             f"Hourly historical AQI features for Karachi — "
             f"Open-Meteo archive backfill ({PIPELINE_VERSION}). "
