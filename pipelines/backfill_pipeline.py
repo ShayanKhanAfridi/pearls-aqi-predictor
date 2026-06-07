@@ -304,8 +304,7 @@ def push_to_hopsworks(df: pd.DataFrame, project):
         version=1,
         primary_key=["city", "timestamp"],
         event_time="timestamp",
-        online_enabled=True,
-        stream=True,
+        online_enabled=False,
         description=(
             f"Hourly historical AQI features for Karachi — "
             f"Open-Meteo archive backfill ({PIPELINE_VERSION}). "
@@ -319,8 +318,15 @@ def push_to_hopsworks(df: pd.DataFrame, project):
     float_cols = [c for c in df.columns if c not in ("city", "timestamp")]
     df[float_cols] = df[float_cols].apply(pd.to_numeric, errors="coerce").astype("float64")
 
-    print(f"\n📤 Pushing {len(df):,} rows in a single insert...")
-    fg.insert(df, write_options={"wait_for_job": True})
+    print(f"\n📤 Pushing {len(df):,} rows...")
+    fg.insert(
+        df,
+        write_options={
+            "wait_for_job": True,
+            "use_spark": False,        # force Python engine
+            "skip_online": True,       # skip online/Kafka write
+        }
+    )
     print("✅ All data pushed to Hopsworks!")
 
 

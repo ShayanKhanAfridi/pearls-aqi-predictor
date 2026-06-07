@@ -466,8 +466,7 @@ def run_inference_and_get_payload():
             version=1,
             primary_key=["city", "generated_at"],
             event_time="generated_at",
-            online_enabled=True,
-            stream=True,
+            online_enabled=False,
             description=f"AQI 3-day forecasts for Karachi ({PIPELINE_VERSION})",
         )
         row_df = pd.DataFrame([{
