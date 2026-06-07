@@ -352,7 +352,6 @@ def load_model_artifact():
         raise RuntimeError(f"Model not found. Train first. Error: {e}")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def run_inference_and_get_payload():
     """
     Full inference pipeline — runs on dashboard load, re-runs every hour.
@@ -524,22 +523,37 @@ def load_backfill(n_days: int = 90) -> pd.DataFrame:
 
 
 # ================================================================
-# RUN INFERENCE ON LOAD  (UNCHANGED)
+# RUN INFERENCE ON LOAD
+# ── Logic:
+#   • @st.cache_data removed — it was caching across ALL users on
+#     Streamlit Cloud, so reload never triggered fresh inference.
+#   • Now: every NEW browser session (fresh open / F5) runs inference.
+#   • Within the SAME session, result is reused for 30 min so that
+#     widget interactions / page switches don't hammer Hopsworks.
+#   • "Refresh Now" button clears session_state → forces re-inference.
 # ================================================================
-if "payload" not in st.session_state:
+_INFERENCE_TTL_SECONDS = 1800  # 30 min in-session cache
+
+_run_now = False
+if st.session_state.get("payload") is None:
+    _run_now = True
+elif "_payload_fetched_at" in st.session_state:
+    _age_s = (datetime.now(timezone.utc) - st.session_state["_payload_fetched_at"]).total_seconds()
+    if _age_s > _INFERENCE_TTL_SECONDS:
+        _run_now = True
+else:
+    # payload exists but no fetch timestamp — treat as stale
+    _run_now = True
+
+if _run_now:
     with st.spinner("🔄 Connecting to Hopsworks and running inference..."):
         try:
             st.session_state["payload"] = run_inference_and_get_payload()
+            st.session_state["_payload_fetched_at"] = datetime.now(timezone.utc)
             st.session_state["inference_error"] = None
         except Exception as e:
             st.session_state["payload"] = None
             st.session_state["inference_error"] = str(e)
-else:
-    try:
-        st.session_state["payload"] = run_inference_and_get_payload()
-        st.session_state["inference_error"] = None
-    except Exception as e:
-        st.session_state["inference_error"] = str(e)
 
 
 # ================================================================
