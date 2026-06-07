@@ -312,13 +312,6 @@ def compute_features(aqi_data, weather_data, future_weather,
 # ---- Push row to Hopsworks ----
 def push_to_feature_store(row_dict, project):
     import platform
-# ---- Push row to Hopsworks ----
-def push_to_feature_store(row_dict, project):
-    import platform
-    import time
-    import requests as _requests
-
-    # Windows local dev: HDFS writes not supported — skip gracefully
     if platform.system() == "Windows":
         print("\n⚠️  HDFS/Delta Lake push skipped on Windows (known limitation).")
         print("   Direct writes to Hopsworks HDFS are not supported on Windows external clients.")
@@ -341,73 +334,16 @@ def push_to_feature_store(row_dict, project):
         online_enabled=False,
         description=f"Hourly AQI features for Karachi — Open-Meteo ({PIPELINE_VERSION})",
     )
-
-    # ── Attempt 1: Standard insert (blocking) ──
     try:
         fg.insert(df, write_options={"wait_for_job": True})
         print(f"✅ Pushed 1 row → Hopsworks at {row_dict['timestamp']}")
-        return
-    except Exception as e:
+    except (OSError, ImportError, Exception) as e:
         err_str = str(e).lower()
-        is_hdfs = any(k in err_str for k in [
-            "hdfs", "rpc", "connectionaborted", "io error occurred",
-            "deltatable", "kernel error", "disconnect"
-        ])
-        if not is_hdfs:
-            raise  # raise other errors (like validation/schema errors)
-        print(f"   ⚠️  Delta/HDFS writer failed: {str(e)[:150]}")
-        print("   🔄 Falling back to REST Ingestion API...")
-
-    # ── Attempt 2: REST Ingestion API (bypasses local HDFS/Delta) ──
-    try:
-        conn = project._hw_client._auth._token
-        host = project._hw_client._host
-        pid  = project.id
-        fs_id = fs.id
-        fg_id = fg.id
-
-        url = f"https://{host}/hopsworks-api/api/project/{pid}/featurestores/{fs_id}/featuregroups/{fg_id}/ingestion"
-        headers = {
-            "Authorization": f"ApiKey {HOPSWORKS_API_KEY}",
-            "Content-Type":  "application/json",
-        }
-        payload = {
-            "dataFormat": "CSV",
-            "items":      df.to_dict(orient="records"),
-        }
-
-        MAX_REST_RETRIES = 3
-        for attempt in range(1, MAX_REST_RETRIES + 1):
-            resp = _requests.post(url, headers=headers, json=payload, timeout=60)
-            if resp.status_code in (200, 201, 202):
-                print(f"✅ Pushed 1 row via REST API → Hopsworks at {row_dict['timestamp']}")
-                return
-            elif resp.status_code == 503 and attempt < MAX_REST_RETRIES:
-                wait = 15 * attempt
-                print(f"   REST attempt {attempt}/{MAX_REST_RETRIES} got 503, retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                raise RuntimeError(
-                    f"REST Ingestion API failed: HTTP {resp.status_code} — {resp.text[:300]}"
-                )
-    except RuntimeError:
-        raise
-    except Exception as rest_err:
-        print(f"   ⚠️  REST API fallback failed: {rest_err}")
-        print("   🔄 Final fallback: write_options offline job trigger...")
-        try:
-            fg.insert(df, write_options={
-                "wait_for_job": False,
-                "start_offline_materialization": False,
-            })
-            print(f"✅ Pushed 1 row (async, no-materialization) → Hopsworks at {row_dict['timestamp']}")
-        except Exception as last_err:
-            raise RuntimeError(
-                f"All insert strategies failed.\n"
-                f"  Delta/HDFS: HDFS RPC disconnected\n"
-                f"  REST API:   {rest_err}\n"
-                f"  Async:      {last_err}"
-            ) from last_err
+        if any(k in err_str for k in ["hdfs", "rpc", "delta", "listener"]):
+            print(f"\n⚠️  HDFS/Delta Lake push skipped on Windows (known limitation).")
+            print(f"   (Error: {str(e)[:120]})")
+        else:
+            raise
 
 
 # ---- Main ----
